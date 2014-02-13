@@ -1,5 +1,5 @@
 module MT940
-  BankParseResults = Struct.new(:opening_balance, :opening_date, :transactions)
+
   class Base
 
     attr_accessor :bank, :opening_balance, :opening_date
@@ -23,9 +23,9 @@ module MT940
       @tag86 = false
       @lines.each do |line|
         @line = line
-        @line.match(/^:(\d{2}F?):/) ? eval('parse_tag_'+ $1) : parse_line
+        @line.match(/^:(\d{2}(F|C)?):/) ? send("parse_tag_#{$1}".to_sym) : parse_line
       end
-      @bank_accounts
+      @bank_statements
     end
 
     private
@@ -42,35 +42,71 @@ module MT940
     end
 
     def initialize(file)
-      @bank_accounts = {}
+      @bank_statements = {}
       @transactions = []
       @bank = self.class.to_s.split('::').last
       @bank = 'Unknown' if @bank == 'Base'
-      @lines = file.readlines
+      temp_lines = file.readlines
+      @lines = []
+      index_of_temp_lines = 0
+      index_in_lines = 0
+      while index_of_temp_lines < temp_lines.size do
+        line = temp_lines[index_of_temp_lines]
+        if mt_940_start_line?(line)
+          @lines << line
+          index_in_lines+=1
+        else
+          @lines[index_in_lines-1] += line
+        end
+        index_of_temp_lines+=1
+      end
+    end
+
+    def mt_940_start_line?(line)
+      line.match /^:?\d{2}(\D?|\d?):?.*$/
     end
 
     def parse_tag_25
       @line.gsub!('.', '')
-      if @line.match(/^:\d{2}:[^\d]*(\d*)/)
-        @bank_account = $1.gsub(/^0/, '')
-        @bank_accounts[@bank_account] ||= BankParseResults.new(nil, nil, [])
-        @tag86 = false
+      case @line
+        when /^:\d{2}:NL/
+          @bank_account_iban = @line[4, 18]
+          @bank_account = @bank_account_iban.strip.split(//).last(10).join.sub(/^[0]*/,"")
+          @is_structured_format = true
+        when /^:\d{2}:\D*(\d*)/
+          @bank_account = $1.gsub(/\D/, '').gsub(/^0+/, '')
+          @is_structured_format = false
+        else
+          raise "Unknown format for tag 25: #{@line}"
       end
+      @bank_statements[@bank_account] ||= []
+      @tag86 = false
     end
+
+    def parse_tag_28
+      @bank_statement = BankStatement.new([], @bank_account, @bank_account_iban, 0, nil, nil)
+      @bank_statements[@bank_account] << @bank_statement
+    end
+
+    alias_method :parse_tag_28C, :parse_tag_28
 
     def parse_tag_60F
       @currency = @line[12..14]
-      opening_date = parse_date(@line[6..11])
-      @bank_accounts[@bank_account].opening_date ||= opening_date
+      balance_date = parse_date(@line[6..11])
 
       type = @line[5] == 'D' ? -1 : 1
-      opening_balance = @line[15..-1].gsub(",", ".").to_f * type
-      @bank_accounts[@bank_account].opening_balance ||= opening_balance
+      amount = @line[15..-1].gsub(",", ".").to_f * type
+      @bank_statement.previous_balance = Balance.new(amount, balance_date, @currency)
+    end
 
-      if opening_date < @bank_accounts[@bank_account].opening_date
-        @bank_accounts[@bank_account].opening_date = opening_date
-        @bank_accounts[@bank_account].opening_balance = opening_balance
-      end
+    def parse_tag_62F
+      @currency = @line[12..14]
+      balance_date = parse_date(@line[6..11])
+
+      type = @line[5] == 'D' ? -1 : 1
+      amount = @line[15..-1].gsub(",", ".").to_f * type
+
+      @bank_statement.new_balance = Balance.new(amount, balance_date, @currency)
     end
 
     def parse_tag_61
@@ -78,15 +114,15 @@ module MT940
         type = $2 == 'D' ? -1 : 1
         @transaction = MT940::Transaction.new(:bank_account => @bank_account, :amount => type * ($3 + '.' + $4).to_f, :bank => @bank, :currency => @currency)
         @transaction.date = parse_date($1)
-        @bank_accounts[@bank_account].transactions << @transaction
+        @bank_statement.transactions << @transaction
         @tag86 = false
       end
     end
 
     def parse_tag_86
-      if !@tag86 && @line.match(/^:86:\s?(.*)$/)
+      if !@tag86 && @line.match(/^:86:\s?(.*)\Z/m)
         @tag86 = true
-        @transaction.description = $1.gsub(/>\d{2}/, '').strip
+        @transaction.description = $1.gsub(/\n/, ' ').gsub(/>\d{2}/, '').strip
         parse_contra_account
       end
     end
@@ -94,7 +130,7 @@ module MT940
     def parse_line
       if @tag86 && @transaction.description
         @transaction.description.lstrip!
-        @transaction.description += ' ' + @line.gsub(/\n/, '').gsub(/>\d{2}\s*/, '').gsub(/\-XXX/, '').gsub(/-$/, '').strip
+        @transaction.description += ' ' + @line.gsub(/\n/, ' ').gsub(/>\d{2}\s*/, '').gsub(/\-XXX/, '').gsub(/-$/, '').strip
         @transaction.description.strip!
       end
     end
